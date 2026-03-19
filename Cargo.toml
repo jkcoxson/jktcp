@@ -1,0 +1,30 @@
+[package]
+name = "jktcp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A userspace TCP stack that runs over any async read/write transport"
+authors = ["Jackson Coxson"]
+documentation = "https://docs.rs/jktcp"
+repository = "https://github.com/jkcoxson/jktcp"
+keywords = ["tcp", "network"]
+
+
+[dependencies]
+tokio = { version = "1", features = [
+  "io-util",
+  "fs",
+  "sync",
+  "rt",
+  "time",
+  "macros",
+] }
+crossfire = "2.1"
+futures = "0.3"
+tracing = "0.1"
+rand = "0.9"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tun-rs = { version = "2.0.8", features = ["async_tokio"] }
+bytes = "1.10"
