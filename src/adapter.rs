@@ -136,6 +136,9 @@ fn seq_lte(a: u32, b: u32) -> bool {
 ///
 /// See the [crate-level documentation](crate) for a full comparison of both
 /// usage patterns.
+/// Default MSS: IPv6 min MTU (1280) minus headers.
+const DEFAULT_MSS: usize = 1280 - 40 - 20;
+
 #[derive(Debug)]
 pub struct Adapter {
     peer: Box<dyn ReadWrite>,
@@ -146,6 +149,8 @@ pub struct Adapter {
     read_buf: [u8; 4096],
     bytes_in_buf: usize,
     pcap: Option<Arc<Mutex<tokio::fs::File>>>,
+    /// Maximum Segment Size for TCP data (payload only, no headers).
+    mss: usize,
 }
 
 impl Adapter {
@@ -159,7 +164,17 @@ impl Adapter {
             read_buf: [0u8; 4096],
             bytes_in_buf: 0,
             pcap: None,
+            mss: DEFAULT_MSS,
         }
+    }
+
+    /// Set the Maximum Segment Size (MSS) for outbound TCP segments.
+    ///
+    /// This should be `MTU - 40 (IPv6 header) - 20 (TCP header)` for the
+    /// tunnel you are using. Defaults to 1220 (based on IPv6 min MTU 1280).
+    pub fn set_mss(&mut self, mss: usize) -> &mut Self {
+        self.mss = mss;
+        self
     }
 
     /// Wraps this adapter in a thread-safe handle.
@@ -384,11 +399,12 @@ impl Adapter {
                 state.write_buffer.clone()
             };
 
-            // psh takes &mut self so we can't hold the state borrow.
-            self.psh(&buf, hp).await.ok();
+            // Segment by MSS so we don't exceed the tunnel MTU.
+            let chunk = &buf[..buf.len().min(self.mss)];
+            self.psh(chunk, hp).await.ok();
 
             if let Some(state) = self.states.get_mut(&hp) {
-                state.write_buffer.clear();
+                state.write_buffer.drain(..chunk.len());
             }
         }
 
