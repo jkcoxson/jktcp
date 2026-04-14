@@ -198,16 +198,22 @@ impl Ipv4Packet {
     }
 
     fn apply_checksum(packet: &mut [u8]) {
+        let hdr_len = ((packet[0] & 0x0F) as usize) * 4;
+        debug_assert!(packet.len() >= hdr_len);
         packet[10] = 0;
         packet[11] = 0;
-        let mut checksum: u16 = 0;
-        for i in 0..packet.len() / 2 {
-            let word = u16::from_be_bytes([packet[i * 2], packet[(i * 2) + 1]]);
-            checksum = checksum.wrapping_add(word);
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < hdr_len {
+            sum += u16::from_be_bytes([packet[i], packet[i + 1]]) as u32;
+            i += 2;
         }
-        let checksum = checksum.to_be_bytes();
-        packet[10] = checksum[0];
-        packet[11] = checksum[1];
+        // Fold carries.
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let checksum = !(sum as u16);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
     }
 }
 
@@ -683,6 +689,27 @@ impl std::fmt::Debug for TcpPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv4_checksum_matches_rfc_1071() {
+        // Header from RFC 1071 §1 example: 20-byte IPv4 header.
+        let mut pkt = vec![
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xC0, 0xA8,
+            0x00, 0x01, 0xC0, 0xA8, 0x00, 0xC7,
+        ];
+        Ipv4Packet::apply_checksum(&mut pkt);
+        let got = u16::from_be_bytes([pkt[10], pkt[11]]);
+        assert_eq!(got, 0xB861);
+
+        let mut sum: u32 = 0;
+        for chunk in pkt.chunks_exact(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xFFFF);
+    }
 
     #[test]
     fn ipv4() {
