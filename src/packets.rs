@@ -1,16 +1,12 @@
 // Jackson Coxson
 // I couldn't find a lib that parses IP/TCP, so I guess we'll write our own
 
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Arc,
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    sync::Mutex,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::debug;
+
+use crate::PcapLog;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ProtocolNumber {
@@ -96,7 +92,7 @@ impl Ipv4Packet {
     /// Asynchronously read an IPv4 packet from a Tokio AsyncRead source.
     pub async fn from_reader<R: AsyncRead + Unpin + AsyncReadExt>(
         reader: &mut R,
-        log: &Option<Arc<Mutex<tokio::fs::File>>>,
+        log: &Option<PcapLog>,
     ) -> Result<Self, std::io::Error> {
         let mut log_packet = Vec::new();
 
@@ -237,10 +233,7 @@ pub(crate) enum IpParseError<T> {
 }
 
 impl Ipv6Packet {
-    pub(crate) fn parse(
-        packet: &[u8],
-        log: &Option<Arc<Mutex<tokio::fs::File>>>,
-    ) -> IpParseError<Ipv6Packet> {
+    pub(crate) fn parse(packet: &[u8], log: &Option<PcapLog>) -> IpParseError<Ipv6Packet> {
         if packet.len() < 40 {
             return IpParseError::NotEnough;
         }
@@ -310,7 +303,7 @@ impl Ipv6Packet {
 
     pub async fn from_reader<R: AsyncRead + Unpin>(
         reader: &mut R,
-        log: &Option<Arc<Mutex<tokio::fs::File>>>,
+        log: &Option<PcapLog>,
     ) -> Result<Self, std::io::Error> {
         let mut log_packet = Vec::new();
 

@@ -94,18 +94,57 @@
 
 // Jackson Coxson
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::trace;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod adapter;
 pub mod handle;
 pub mod packets;
 pub mod stream;
+
+/// `Option<PcapLog>` is the type of the optional pcap log handle threaded through
+/// packet parsing. With the `pcap` feature on this is the real
+/// `Arc<tokio::sync::Mutex<tokio::fs::File>>`; with it off (or on wasm32, where
+/// `tokio::fs` is unavailable) it's a zero-sized placeholder so the pub APIs
+/// keep the same shape.
+#[cfg(feature = "pcap")]
+pub type PcapLog = std::sync::Arc<tokio::sync::Mutex<tokio::fs::File>>;
+#[cfg(not(feature = "pcap"))]
+#[derive(Debug, Clone, Copy)]
+pub struct PcapLog;
+
+/// Time primitives that work across native and wasm32-unknown-unknown.
+///
+/// On native this is `tokio::time`; on wasm32 we route to `wasmtimer` because
+/// tokio's timer panics at runtime there (no timer backend available).
+/// `Instant` lives under `wasmtimer::std` rather than `wasmtimer::tokio`, so
+/// it's re-exported explicitly.
+#[allow(unused_imports)]
+pub(crate) mod time {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use tokio::time::*;
+    #[cfg(target_arch = "wasm32")]
+    pub use wasmtimer::tokio::*;
+    #[cfg(target_arch = "wasm32")]
+    pub use wasmtimer::std::Instant;
+}
+
+/// Spawn a `'static + Send` future on whatever executor is current. On native
+/// this is `tokio::spawn`; on wasm32 it's `wasm_bindgen_futures::spawn_local`,
+/// which doesn't require Send but accepts Send futures fine.
+#[allow(dead_code)]
+pub(crate) fn spawn<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::spawn(fut);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(fut);
+    }
+}
 
 /// A marker trait for types that can act as the underlying transport.
 ///
@@ -117,7 +156,11 @@ pub trait ReadWrite: AsyncRead + AsyncWrite + Unpin + Send + Sync + std::fmt::De
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + std::fmt::Debug> ReadWrite for T {}
 
-pub(crate) fn log_packet(file: &Arc<tokio::sync::Mutex<tokio::fs::File>>, packet: &[u8]) {
+#[cfg(feature = "pcap")]
+pub(crate) fn log_packet(file: &PcapLog, packet: &[u8]) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
+    use tracing::trace;
     trace!("Logging {} byte packet", packet.len());
     let packet = packet.to_vec();
     let file = file.to_owned();
@@ -140,6 +183,10 @@ pub(crate) fn log_packet(file: &Arc<tokio::sync::Mutex<tokio::fs::File>>, packet
         file.write_all(&packet).await.unwrap();
     });
 }
+
+#[cfg(not(feature = "pcap"))]
+#[allow(dead_code)]
+pub(crate) fn log_packet(_file: &PcapLog, _packet: &[u8]) {}
 
 #[cfg(test)]
 mod tests {

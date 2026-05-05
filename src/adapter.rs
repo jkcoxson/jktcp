@@ -15,20 +15,17 @@ use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
     net::IpAddr,
-    path::Path,
-    sync::Arc,
 };
 
-use tokio::time::Instant;
+#[cfg(feature = "pcap")]
+use std::path::Path;
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
-};
+use crate::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
 use crate::packets::{Ipv4Packet, Ipv6Packet, ProtocolNumber, TcpFlags, TcpPacket};
-use crate::{ReadWrite, packets::IpParseError};
+use crate::{PcapLog, ReadWrite, packets::IpParseError};
 
 /// Maximum number of retransmission attempts before a connection is killed.
 const MAX_RETRIES: u32 = 5;
@@ -148,7 +145,7 @@ pub struct Adapter {
     dropped: Vec<u16>,
     read_buf: [u8; 4096],
     bytes_in_buf: usize,
-    pcap: Option<Arc<Mutex<tokio::fs::File>>>,
+    pcap: Option<PcapLog>,
     /// Maximum Segment Size for TCP data (payload only, no headers).
     mss: usize,
 }
@@ -231,6 +228,7 @@ impl Adapter {
         Ok(host_port)
     }
 
+    #[cfg(feature = "pcap")]
     pub async fn pcap(&mut self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let mut file = tokio::fs::File::create(path).await?;
         file.write_all(&0xa1b2c3d4_u32.to_le_bytes()).await?;
@@ -240,7 +238,7 @@ impl Adapter {
         file.write_all(&0_u32.to_le_bytes()).await?;
         file.write_all(&(u16::MAX as u32).to_le_bytes()).await?;
         file.write_all(&101_u32.to_le_bytes()).await?;
-        self.pcap = Some(Arc::new(Mutex::new(file)));
+        self.pcap = Some(std::sync::Arc::new(tokio::sync::Mutex::new(file)));
         Ok(())
     }
 
@@ -511,7 +509,7 @@ impl Adapter {
             }
             // Short timeout so retransmissions fire in the AdapterStream case
             // (the AdapterHandle has a 1ms tick that calls write_buffer_flush directly).
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+            _ = crate::time::sleep(std::time::Duration::from_millis(500)) => {
                 self.check_retransmissions().await
             }
         }
