@@ -143,7 +143,7 @@ pub struct Adapter {
     peer_ip: IpAddr,
     states: HashMap<u16, ConnectionState>,
     dropped: Vec<u16>,
-    read_buf: [u8; 4096],
+    read_buf: [u8; 65536],
     bytes_in_buf: usize,
     pcap: Option<PcapLog>,
     /// Maximum Segment Size for TCP data (payload only, no headers).
@@ -158,7 +158,7 @@ impl Adapter {
             peer_ip,
             states: HashMap::new(),
             dropped: Vec::new(),
-            read_buf: [0u8; 4096],
+            read_buf: [0u8; 65536],
             bytes_in_buf: 0,
             pcap: None,
             mss: DEFAULT_MSS,
@@ -383,10 +383,8 @@ impl Adapter {
 
         let host_ports: Vec<u16> = self.states.keys().cloned().collect();
         for hp in host_ports {
-            // Drain one MSS-sized chunk before the await so we don't have to clone
-            // (or hold a borrow into) the whole pending write buffer.
             let chunk: Vec<u8> = {
-                let Some(state) = self.states.get_mut(&hp) else {
+                let Some(state) = self.states.get(&hp) else {
                     continue;
                 };
                 if state.write_buffer.is_empty() {
@@ -397,10 +395,16 @@ impl Adapter {
                     continue;
                 }
                 let n = state.write_buffer.len().min(self.mss);
-                state.write_buffer.drain(..n).collect()
+                state.write_buffer.iter().take(n).copied().collect()
             };
 
-            self.psh(&chunk, hp).await.ok();
+            let chunk_len = chunk.len();
+            if self.psh(chunk, hp).await.is_err() {
+                continue;
+            }
+            if let Some(state) = self.states.get_mut(&hp) {
+                state.write_buffer.drain(..chunk_len);
+            }
         }
 
         // Reap connections that were dropped while we had the lock.
@@ -678,8 +682,9 @@ impl Adapter {
         self.log_packet(&ip)
     }
 
-    /// Send a PSH segment and record it in the unacked queue.
-    async fn psh(&mut self, data: &[u8], host_port: u16) -> Result<(), std::io::Error> {
+    /// Send a PSH segment and record it in the unacked queue. Takes `data` by
+    /// value so the buffer can be moved into the unacked record without a copy.
+    async fn psh(&mut self, data: Vec<u8>, host_port: u16) -> Result<(), std::io::Error> {
         let Some(state) = self.states.get(&host_port) else {
             return Err(std::io::Error::new(
                 ErrorKind::NotConnected,
@@ -704,7 +709,7 @@ impl Adapter {
                 ..Default::default()
             },
             u16::MAX - 1,
-            data,
+            &data,
         );
         let ip = self.ip_wrap(&tcp);
         let _ = state;
@@ -713,13 +718,14 @@ impl Adapter {
         self.log_packet(&ip)?;
 
         if let Some(state) = self.states.get_mut(&host_port) {
+            let len = data.len() as u32;
             state.unacked.push_back(UnackedSegment {
                 seq,
-                data: data.to_vec(),
+                data,
                 sent_at: Instant::now(),
                 retries: 0,
             });
-            state.seq = state.seq.wrapping_add(data.len() as u32);
+            state.seq = state.seq.wrapping_add(len);
         }
 
         Ok(())

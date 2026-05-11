@@ -123,9 +123,9 @@ pub(crate) mod time {
     #[cfg(not(target_arch = "wasm32"))]
     pub use tokio::time::*;
     #[cfg(target_arch = "wasm32")]
-    pub use wasmtimer::tokio::*;
-    #[cfg(target_arch = "wasm32")]
     pub use wasmtimer::std::Instant;
+    #[cfg(target_arch = "wasm32")]
+    pub use wasmtimer::tokio::*;
 }
 
 /// Spawn a `'static + Send` future on whatever executor is current. On native
@@ -243,7 +243,7 @@ mod tests {
             }
 
             // If our buffer is empty, try to read more data
-            let mut temp_buf = vec![0u8; 4096]; // Temporary buffer with reasonable size
+            let mut temp_buf = vec![0u8; 65536];
 
             match this.device.poll_recv(cx, &mut temp_buf) {
                 Poll::Ready(Ok(n)) => {
@@ -383,11 +383,15 @@ mod tests {
         const TOTAL_BYTES: usize = 16 << 20; // 16 MiB
         const CHUNK_SIZE: usize = 4096;
 
+        // Target device typically uses MTU 16000.
+        const MTU: u16 = 16000;
+        const MSS: usize = MTU as usize - 40 - 20;
+
         let our_ip = Ipv6Addr::from_str("fd12:3456:789b::1").unwrap();
         let their_ip = Ipv6Addr::from_str("fd12:3456:789b::2").unwrap();
         let dev = DeviceBuilder::new()
             .ipv6(their_ip, "ffff:ffff:ffff:ffff::")
-            .mtu(1420)
+            .mtu(MTU)
             .build_async()
             .expect("Failed to create tunnel. Are you root?");
 
@@ -401,7 +405,7 @@ mod tests {
             IpAddr::V6(our_ip),
             IpAddr::V6(their_ip),
         );
-        adapter.set_mss(8940);
+        adapter.set_mss(MSS);
 
         // Echo server: read whatever arrives, write it straight back.
         tokio::task::spawn(async move {
