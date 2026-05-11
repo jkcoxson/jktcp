@@ -179,6 +179,10 @@ impl AdapterHandle {
                             // Best-effort close. For RST this just tidies state on our side
                             let _ = adapter.close(hp).await;
                         }
+
+                        // An ACK in that packet may have cleared `unacked` for some
+                        // connection; flush now instead of waiting up to 1ms for the tick.
+                        let _ = adapter.write_buffer_flush().await;
                     }
 
                     _ = tick.tick() => {

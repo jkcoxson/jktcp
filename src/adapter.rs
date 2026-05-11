@@ -72,7 +72,7 @@ struct ConnectionState {
     host_port: u16,
     peer_port: u16,
     read_buffer: Vec<u8>,
-    write_buffer: Vec<u8>,
+    write_buffer: VecDeque<u8>,
     status: ConnectionStatus,
     /// Segments we have sent but not yet received an ACK for (stop-and-wait queue).
     unacked: VecDeque<UnackedSegment>,
@@ -93,7 +93,7 @@ impl ConnectionState {
             host_port,
             peer_port,
             read_buffer: Vec::new(),
-            write_buffer: Vec::new(),
+            write_buffer: VecDeque::new(),
             status: ConnectionStatus::WaitingForSyn,
             unacked: VecDeque::new(),
         }
@@ -284,7 +284,7 @@ impl Adapter {
     ) -> Result<(), std::io::Error> {
         match self.states.get_mut(&host_port) {
             Some(s) => {
-                s.write_buffer.extend_from_slice(payload);
+                s.write_buffer.extend(payload.iter().copied());
                 Ok(())
             }
             None => Err(std::io::Error::new(
@@ -385,8 +385,10 @@ impl Adapter {
 
         let host_ports: Vec<u16> = self.states.keys().cloned().collect();
         for hp in host_ports {
-            let buf = {
-                let Some(state) = self.states.get(&hp) else {
+            // Drain one MSS-sized chunk before the await so we don't have to clone
+            // (or hold a borrow into) the whole pending write buffer.
+            let chunk: Vec<u8> = {
+                let Some(state) = self.states.get_mut(&hp) else {
                     continue;
                 };
                 if state.write_buffer.is_empty() {
@@ -396,16 +398,11 @@ impl Adapter {
                 if !state.unacked.is_empty() {
                     continue;
                 }
-                state.write_buffer.clone()
+                let n = state.write_buffer.len().min(self.mss);
+                state.write_buffer.drain(..n).collect()
             };
 
-            // Segment by MSS so we don't exceed the tunnel MTU.
-            let chunk = &buf[..buf.len().min(self.mss)];
-            self.psh(chunk, hp).await.ok();
-
-            if let Some(state) = self.states.get_mut(&hp) {
-                state.write_buffer.drain(..chunk.len());
-            }
+            self.psh(&chunk, hp).await.ok();
         }
 
         // Reap connections that were dropped while we had the lock.
