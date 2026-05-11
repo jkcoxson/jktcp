@@ -1,6 +1,6 @@
 [package]
 name = "jktcp"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2024"
 license = "MIT"
 description = "A userspace TCP stack that runs over any async read/write transport"
@@ -11,20 +11,40 @@ keywords = ["tcp", "network"]
 
 
 [dependencies]
-tokio = { version = "1", features = [
+# Wasm-safe subset always on. `fs` (pcap) and `rt` (spawn) are pulled in via
+# target deps below for native, where pcap is on by default.
+tokio = { version = "1", default-features = false, features = [
   "io-util",
-  "fs",
   "sync",
-  "rt",
-  "time",
   "macros",
 ] }
-crossfire = "2.1"
-futures = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 rand = "0.9"
+
+# Native-only: real tokio runtime + filesystem for pcap, plus crossfire for
+# the lock-free channels used in the multi-task handle path.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["fs", "rt", "time"] }
+
+# wasm32-unknown-unknown: drop-in replacement for tokio::time, plus a JS
+# executor for the `crate::spawn` shim. No filesystem, no pcap. The
+# transitive `getrandom` (pulled by `rand` for ISN selection) needs the
+# `wasm_js` feature forwarded so it compiles against Web Crypto.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmtimer = { version = "0.4", default-features = false, features = ["tokio"] }
+wasm-bindgen-futures = "0.4"
+getrandom = { version = "0.3", default-features = false, features = [
+  "wasm_js",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tun-rs = { version = "2.0.8", features = ["async_tokio"] }
 bytes = "1.10"
+
+[features]
+default = ["pcap"]
+# Enables `Adapter::pcap` and the underlying `tokio::fs::File` writer. Off on
+# wasm32 (no filesystem) and for any consumer that doesn't want the dep.
+pcap = []

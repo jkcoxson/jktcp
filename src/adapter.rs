@@ -15,20 +15,17 @@ use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
     net::IpAddr,
-    path::Path,
-    sync::Arc,
 };
 
-use tokio::time::Instant;
+#[cfg(feature = "pcap")]
+use std::path::Path;
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
-};
+use crate::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
 use crate::packets::{Ipv4Packet, Ipv6Packet, ProtocolNumber, TcpFlags, TcpPacket};
-use crate::{ReadWrite, packets::IpParseError};
+use crate::{PcapLog, ReadWrite, packets::IpParseError};
 
 /// Maximum number of retransmission attempts before a connection is killed.
 const MAX_RETRIES: u32 = 5;
@@ -148,7 +145,7 @@ pub struct Adapter {
     dropped: Vec<u16>,
     read_buf: [u8; 4096],
     bytes_in_buf: usize,
-    pcap: Option<Arc<Mutex<tokio::fs::File>>>,
+    pcap: Option<PcapLog>,
     /// Maximum Segment Size for TCP data (payload only, no headers).
     mss: usize,
 }
@@ -231,6 +228,7 @@ impl Adapter {
         Ok(host_port)
     }
 
+    #[cfg(feature = "pcap")]
     pub async fn pcap(&mut self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let mut file = tokio::fs::File::create(path).await?;
         file.write_all(&0xa1b2c3d4_u32.to_le_bytes()).await?;
@@ -240,7 +238,7 @@ impl Adapter {
         file.write_all(&0_u32.to_le_bytes()).await?;
         file.write_all(&(u16::MAX as u32).to_le_bytes()).await?;
         file.write_all(&101_u32.to_le_bytes()).await?;
-        self.pcap = Some(Arc::new(Mutex::new(file)));
+        self.pcap = Some(std::sync::Arc::new(tokio::sync::Mutex::new(file)));
         Ok(())
     }
 
@@ -508,7 +506,7 @@ impl Adapter {
             }
             // Short timeout so retransmissions fire in the AdapterStream case
             // (the AdapterHandle has a 1ms tick that calls write_buffer_flush directly).
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+            _ = crate::time::sleep(std::time::Duration::from_millis(500)) => {
                 self.check_retransmissions().await
             }
         }
@@ -730,29 +728,86 @@ impl Adapter {
     async fn read_ip_packet(&mut self) -> Result<Vec<u8>, std::io::Error> {
         self.write_buffer_flush().await?;
         loop {
-            match Ipv6Packet::parse(&self.read_buf[..self.bytes_in_buf], &self.pcap) {
+            let parsed = match self.host_ip {
+                IpAddr::V4(_) => Self::try_parse_v4(&self.read_buf[..self.bytes_in_buf]),
+                IpAddr::V6(_) => {
+                    match Ipv6Packet::parse(&self.read_buf[..self.bytes_in_buf], &self.pcap) {
+                        IpParseError::Ok {
+                            packet,
+                            bytes_consumed,
+                        } => IpParseError::Ok {
+                            packet: packet.payload,
+                            bytes_consumed,
+                        },
+                        IpParseError::NotEnough => IpParseError::NotEnough,
+                        IpParseError::Invalid => IpParseError::Invalid,
+                    }
+                }
+            };
+            match parsed {
                 IpParseError::Ok {
                     packet,
                     bytes_consumed,
                 } => {
+                    if let Some(pcap) = &self.pcap
+                        && matches!(self.host_ip, IpAddr::V4(_))
+                    {
+                        crate::log_packet(pcap, &self.read_buf[..bytes_consumed]);
+                    }
+
                     self.read_buf
                         .copy_within(bytes_consumed..self.bytes_in_buf, 0);
                     self.bytes_in_buf -= bytes_consumed;
-                    return Ok(packet.payload);
+                    return Ok(packet);
                 }
                 IpParseError::NotEnough => {}
                 IpParseError::Invalid => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        "invalid IPv6 packet",
-                    ));
+                    let kind = if matches!(self.host_ip, IpAddr::V4(_)) {
+                        "invalid IPv4 packet"
+                    } else {
+                        "invalid IPv6 packet"
+                    };
+                    return Err(std::io::Error::new(ErrorKind::InvalidData, kind));
                 }
             }
             let n = self
                 .peer
                 .read(&mut self.read_buf[self.bytes_in_buf..])
                 .await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "transport closed",
+                ));
+            }
             self.bytes_in_buf += n;
+        }
+    }
+
+    /// Inspect the buffer for a complete IPv4 packet. Returns the TCP/UDP
+    /// payload and the number of bytes consumed.
+    fn try_parse_v4(buf: &[u8]) -> IpParseError<Vec<u8>> {
+        if buf.len() < 20 {
+            return IpParseError::NotEnough;
+        }
+        if (buf[0] >> 4) != 4 {
+            return IpParseError::Invalid;
+        }
+        let ihl_bytes = ((buf[0] & 0x0F) as usize) * 4;
+        let total_length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        if ihl_bytes < 20 || total_length < ihl_bytes {
+            return IpParseError::Invalid;
+        }
+        if buf.len() < total_length {
+            return IpParseError::NotEnough;
+        }
+        let packet = match Ipv4Packet::parse(&buf[..total_length]) {
+            Some(p) => p,
+            None => return IpParseError::Invalid,
+        };
+        IpParseError::Ok {
+            packet: packet.payload,
+            bytes_consumed: total_length,
         }
     }
 

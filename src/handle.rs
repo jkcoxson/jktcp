@@ -1,12 +1,13 @@
 //! Thread-safe handle over a background-task [`crate::adapter::Adapter`].
 //!
-//! [`AdapterHandle`] spawns the adapter's I/O loop onto the Tokio runtime and
-//! communicates with it through lock-free channels.  The resulting
-//! [`StreamHandle`] is `Send + Sync + 'static`, enabling use cases that
-//! [`crate::stream::AdapterStream`] cannot support:
+//! [`AdapterHandle`] spawns the adapter's I/O loop onto whatever async
+//! executor is current (tokio on native, `wasm_bindgen_futures::spawn_local`
+//! on `wasm32-unknown-unknown`) and communicates with it through tokio
+//! `mpsc` channels. The resulting [`StreamHandle`] is `Send + Sync + 'static`,
+//! enabling use cases that [`crate::stream::AdapterStream`] cannot support:
 //!
 //! - **Multiple concurrent connections** on the same adapter.
-//! - Passing a stream to [`tokio::spawn`] or storing it in an `Arc<Mutex<…>>`.
+//! - Passing a stream to a `spawn` call or storing it in an `Arc<Mutex<…>>`.
 //! - Storing the stream in a struct without a lifetime parameter.
 //! - FFI or any context that requires `'static` bounds.
 //!
@@ -16,8 +17,8 @@
 //!
 //! # Background task
 //!
-//! [`AdapterHandle::new`] immediately calls `tokio::spawn`. The spawned task
-//! runs a `select!` loop that races three branches:
+//! [`AdapterHandle::new`] immediately spawns a task. The spawned task runs a
+//! `select!` loop that races three branches:
 //!
 //! 1. **Incoming messages**: connect/send/pcap/close requests from callers.
 //! 2. **Incoming packets**: reads the next frame from the transport and updates
@@ -28,27 +29,28 @@
 //! The task exits when the last [`AdapterHandle`] is dropped or when
 //! [`AdapterHandle::close`] is called.
 
-use std::{collections::HashMap, path::PathBuf, sync::Mutex, task::Poll};
+use std::{collections::HashMap, sync::Mutex, task::Poll};
 
-use crossfire::{AsyncRx, MTx, Tx, mpsc, spsc, stream::AsyncStream};
+#[cfg(feature = "pcap")]
+use std::path::PathBuf;
+
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::oneshot,
-    time::timeout,
+    sync::{mpsc, oneshot},
 };
 use tracing::trace;
 
 use crate::adapter::ConnectionStatus;
-
-pub type ConnectToPortRes =
-    oneshot::Sender<Result<(u16, AsyncRx<Result<Vec<u8>, std::io::Error>>), std::io::Error>>;
+use crate::time::timeout;
 
 enum HandleMessage {
     /// Returns the host port
     ConnectToPort {
         target: u16,
-        res: ConnectToPortRes,
+        res: oneshot::Sender<
+            Result<(u16, mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>), std::io::Error>,
+        >,
     },
     Close {
         host_port: u16,
@@ -58,6 +60,7 @@ enum HandleMessage {
         data: Vec<u8>,
         res: oneshot::Sender<Result<(), std::io::Error>>,
     },
+    #[cfg(feature = "pcap")]
     Pcap {
         path: PathBuf,
         res: oneshot::Sender<Result<(), std::io::Error>>,
@@ -71,28 +74,29 @@ enum HandleMessage {
 /// Each clone shares the same channel sender to the background task.
 ///
 /// Drop all clones (or call [`AdapterHandle::close`]) to shut down the background task.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AdapterHandle {
-    sender: MTx<HandleMessage>,
+    sender: mpsc::UnboundedSender<HandleMessage>,
 }
 
 impl AdapterHandle {
     pub fn new(mut adapter: crate::adapter::Adapter) -> Self {
-        let (tx, rx) = mpsc::unbounded_async();
-        tokio::spawn(async move {
-            let mut handles: HashMap<u16, Tx<Result<Vec<u8>, std::io::Error>>> = HashMap::new();
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
+        let (tx, mut rx) = mpsc::unbounded_channel::<HandleMessage>();
+        crate::spawn(async move {
+            let mut handles: HashMap<u16, mpsc::UnboundedSender<Result<Vec<u8>, std::io::Error>>> =
+                HashMap::new();
+            let mut tick = crate::time::interval(std::time::Duration::from_millis(1));
 
             loop {
                 tokio::select! {
                     // check for messages for us
                     msg = rx.recv() => {
                         match msg {
-                            Ok(m) => match m {
+                            Some(m) => match m {
                                 HandleMessage::ConnectToPort { target, res } => {
                                     let connect_response = match adapter.connect(target).await {
                                         Ok(c) => {
-                                            let (ptx, prx) = spsc::unbounded_async();
+                                            let (ptx, prx) = mpsc::unbounded_channel();
                                             handles.insert(c, ptx);
                                             Ok((c, prx))
                                         }
@@ -116,6 +120,7 @@ impl AdapterHandle {
                                         res.send(response).ok();
                                     }
                                 }
+                                #[cfg(feature = "pcap")]
                                 HandleMessage::Pcap {
                                     path,
                                     res
@@ -126,7 +131,7 @@ impl AdapterHandle {
                                     break;
                                 }
                             },
-                            Err(_) => {
+                            None => {
                                 break;
                             },
                         }
@@ -216,7 +221,7 @@ impl AdapterHandle {
                 let (host_port, recv_channel) = r?;
                 Ok(StreamHandle {
                     host_port,
-                    recv_channel: Mutex::new(recv_channel.into_stream()),
+                    recv_channel: Mutex::new(recv_channel),
                     send_channel: self.sender.clone(),
                     read_buffer: Vec::new(),
                     pending_writes: FuturesUnordered::new(),
@@ -233,6 +238,7 @@ impl AdapterHandle {
         }
     }
 
+    #[cfg(feature = "pcap")]
     pub async fn pcap(&mut self, path: impl Into<PathBuf>) -> Result<(), std::io::Error> {
         let (res_tx, res_rx) = oneshot::channel();
         let path: PathBuf = path.into();
@@ -278,8 +284,10 @@ impl AdapterHandle {
 #[derive(Debug)]
 pub struct StreamHandle {
     host_port: u16,
-    recv_channel: Mutex<AsyncStream<Result<Vec<u8>, std::io::Error>>>,
-    send_channel: MTx<HandleMessage>,
+    // Mutex only exists to satisfy the `Sync` bound on `ReadWrite`; this is the
+    // sole owner of the receiver, so it should never actually contend.
+    recv_channel: Mutex<mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>>,
+    send_channel: mpsc::UnboundedSender<HandleMessage>,
 
     read_buffer: Vec<u8>,
     pending_writes: FuturesUnordered<oneshot::Receiver<Result<(), std::io::Error>>>,
@@ -315,7 +323,7 @@ impl AsyncRead for StreamHandle {
         // this should always return, since we're the only owner of the mutex. The mutex is only
         // used to satisfy the `Send` bounds of ReadWrite.
         let mut extend_slice = Vec::new();
-        let res = match lock.poll_item(cx) {
+        let res = match lock.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
 
             // Disconnected/ended: map to BrokenPipe
