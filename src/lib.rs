@@ -328,4 +328,101 @@ mod tests {
         let mut buf = Vec::new();
         let _ = tokio::io::stdin().read(&mut buf).await.unwrap();
     }
+
+    const SPEED_PORT: u16 = 5556;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handle_speed() {
+        const TOTAL_BYTES: usize = 16 << 20; // 16 MiB
+        const CHUNK_SIZE: usize = 4096;
+
+        let our_ip = Ipv6Addr::from_str("fd12:3456:789b::1").unwrap();
+        let their_ip = Ipv6Addr::from_str("fd12:3456:789b::2").unwrap();
+        let dev = DeviceBuilder::new()
+            .ipv6(their_ip, "ffff:ffff:ffff:ffff::")
+            .mtu(1420)
+            .build_async()
+            .expect("Failed to create tunnel. Are you root?");
+
+        println!("Created tunnel [{:?}] {}", dev.name(), their_ip);
+
+        let mut adapter = Adapter::new(
+            Box::new(AsyncDeviceWrapper {
+                device: dev,
+                buffer: BytesMut::new(),
+            }),
+            IpAddr::V6(our_ip),
+            IpAddr::V6(their_ip),
+        );
+        adapter.set_mss(8940);
+
+        // Echo server: read whatever arrives, write it straight back.
+        tokio::task::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(format!("[::0]:{SPEED_PORT}"))
+                .await
+                .unwrap();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::task::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Give the kernel a moment to bring the interface up and start listening.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut handle = adapter.to_async_handle();
+        let stream = match handle.connect(SPEED_PORT).await {
+            Ok(s) => s,
+            Err(e) => panic!("connect failed: {e:?}"),
+        };
+
+        let (mut reader, mut writer) = tokio::io::split(stream);
+
+        let payload = vec![0xABu8; CHUNK_SIZE];
+        let start = std::time::Instant::now();
+
+        let write_task = tokio::task::spawn(async move {
+            let chunks = TOTAL_BYTES / CHUNK_SIZE;
+            for _ in 0..chunks {
+                writer.write_all(&payload).await.expect("write_all");
+            }
+            writer.flush().await.expect("flush");
+        });
+
+        let read_task = tokio::task::spawn(async move {
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut got = 0usize;
+            while got < TOTAL_BYTES {
+                let n = reader.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    panic!("eof at {got}/{TOTAL_BYTES}");
+                }
+                got += n;
+            }
+        });
+
+        write_task.await.expect("writer panicked");
+        read_task.await.expect("reader panicked");
+        let total_elapsed = start.elapsed();
+
+        let mib = TOTAL_BYTES as f64 / (1024.0 * 1024.0);
+        println!(
+            "handle_speed: {mib:.2} MiB echo in {CHUNK_SIZE}-byte chunks   \
+             {:>7.2} ms   {:>7.3} MiB/s",
+            total_elapsed.as_secs_f64() * 1000.0,
+            mib / total_elapsed.as_secs_f64(),
+        );
+
+        handle.close().await.ok();
+    }
 }
