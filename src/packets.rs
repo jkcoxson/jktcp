@@ -508,9 +508,8 @@ impl TcpPacket {
 
         // Parse options if the header is longer than 20 bytes
         let options_end = data_offset as usize;
-        let options = if options_end > 20 {
-            // packet[20..options_end].to_vec()
-            Vec::new()
+        let options = if options_end > 20 && options_end <= packet.len() {
+            packet[20..options_end].to_vec()
         } else {
             Vec::new()
         };
@@ -537,6 +536,9 @@ impl TcpPacket {
         })
     }
 
+    /// Build a TCP segment. `options` is appended verbatim and then
+    /// NOP-padded (kind=1) up to a 4-byte boundary; pass `&[]` if you don't
+    /// need any. See [`window_scale_option`] for a wscale builder.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         source_ip: IpAddr,
@@ -547,10 +549,15 @@ impl TcpPacket {
         acknowledgment_number: u32,
         flags: TcpFlags,
         window_size: u16,
+        options: &[u8],
         payload: &[u8],
     ) -> Vec<u8> {
-        let data_offset = 5_u8; // Header length in 32-bit words
-        let mut packet = Vec::with_capacity(20 + payload.len());
+        // TCP options must end on a 4-byte boundary; pad with NOPs (kind 1).
+        let pad = (4 - options.len() % 4) % 4;
+        let opt_total = options.len() + pad;
+        debug_assert!(opt_total.is_multiple_of(4));
+        let data_offset = 5_u8 + (opt_total / 4) as u8;
+        let mut packet = Vec::with_capacity(20 + opt_total + payload.len());
 
         // Source and Destination Ports
         packet.extend_from_slice(&source_port.to_be_bytes());
@@ -569,7 +576,9 @@ impl TcpPacket {
         packet.extend_from_slice(&[0, 0]); // Checksum placeholder
         packet.extend_from_slice(&[0, 0]); // Urgent pointer
 
-        // No options, keeping it simple
+        // Options + NOP padding to 4-byte boundary.
+        packet.extend_from_slice(options);
+        packet.extend(std::iter::repeat_n(1, pad));
         packet.extend_from_slice(payload);
 
         // Compute checksum with the appropriate pseudo-header
@@ -659,6 +668,46 @@ impl TcpPacket {
         // One's complement
         !(sum as u16)
     }
+}
+
+/// Build a TCP Window Scale option
+pub fn window_scale_option(shift: u8) -> [u8; 3] {
+    // kind=3, length=3, shift_count
+    [3, 3, shift.min(14)]
+}
+
+/// Scan a TCP options blob for the Window Scale option. Returns the shift
+/// count if present and well-formed; otherwise None.
+pub fn parse_window_scale(options: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i < options.len() {
+        match options[i] {
+            0 => return None, // End-of-options
+            1 => {
+                i += 1;
+                continue;
+            } // NOP
+            3 => {
+                // Window scale: kind=3, length=3, shift.
+                if i + 2 < options.len() && options[i + 1] == 3 {
+                    return Some(options[i + 2].min(14));
+                }
+                return None;
+            }
+            _ => {
+                // Skip unknown TLV option by its length byte.
+                if i + 1 >= options.len() {
+                    return None;
+                }
+                let len = options[i + 1] as usize;
+                if len < 2 {
+                    return None;
+                }
+                i += len;
+            }
+        }
+    }
+    None
 }
 
 impl std::fmt::Debug for TcpPacket {
@@ -752,6 +801,7 @@ mod tests {
                 fin: false,
             },
             5555,
+            &[],
             &[1, 2, 3, 4, 5],
         );
         let i1 = Ipv6Packet::create(

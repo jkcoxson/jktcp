@@ -15,6 +15,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
     net::IpAddr,
+    sync::Arc,
 };
 
 #[cfg(feature = "pcap")]
@@ -33,6 +34,12 @@ const MAX_RETRIES: u32 = 5;
 /// Initial retransmission timeout in milliseconds. Doubles on each retry.
 const INITIAL_RTO_MS: u64 = 200;
 
+const OUR_WSCALE: u8 = 8;
+
+/// Default cap on bytes in flight per connection, in bytes. Overridden via
+/// [`Adapter::set_send_window`].
+const DEFAULT_SEND_WINDOW: usize = 1 << 20; // 1 MiB
+
 // ---------------------------------------------------------------------------
 // Unacknowledged segment tracking
 // ---------------------------------------------------------------------------
@@ -40,7 +47,7 @@ const INITIAL_RTO_MS: u64 = 200;
 #[derive(Debug, Clone)]
 struct UnackedSegment {
     seq: u32,
-    data: Vec<u8>,
+    data: Arc<[u8]>,
     sent_at: Instant,
     retries: u32,
 }
@@ -71,8 +78,11 @@ struct ConnectionState {
     read_buffer: Vec<u8>,
     write_buffer: VecDeque<u8>,
     status: ConnectionStatus,
-    /// Segments we have sent but not yet received an ACK for (stop-and-wait queue).
+    /// Segments we have sent but not yet received an ACK for, in send order.
     unacked: VecDeque<UnackedSegment>,
+    bytes_in_flight: usize,
+    peer_window: u32,
+    peer_wscale: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,6 +103,9 @@ impl ConnectionState {
             write_buffer: VecDeque::new(),
             status: ConnectionStatus::WaitingForSyn,
             unacked: VecDeque::new(),
+            bytes_in_flight: 0,
+            peer_window: 0,
+            peer_wscale: None,
         }
     }
 }
@@ -148,6 +161,7 @@ pub struct Adapter {
     pcap: Option<PcapLog>,
     /// Maximum Segment Size for TCP data (payload only, no headers).
     mss: usize,
+    send_window: usize,
 }
 
 impl Adapter {
@@ -162,6 +176,7 @@ impl Adapter {
             bytes_in_buf: 0,
             pcap: None,
             mss: DEFAULT_MSS,
+            send_window: DEFAULT_SEND_WINDOW,
         }
     }
 
@@ -171,6 +186,11 @@ impl Adapter {
     /// tunnel you are using. Defaults to 1220 (based on IPv6 min MTU 1280).
     pub fn set_mss(&mut self, mss: usize) -> &mut Self {
         self.mss = mss;
+        self
+    }
+
+    pub fn set_send_window(&mut self, window: usize) -> &mut Self {
+        self.send_window = window;
         self
     }
 
@@ -257,6 +277,7 @@ impl Adapter {
                     ..Default::default()
                 },
                 u16::MAX - 1,
+                &[],
                 &[],
             );
             let ip = self.ip_wrap(&tcp);
@@ -374,8 +395,9 @@ impl Adapter {
     // Flush / retransmit
     // -----------------------------------------------------------------------
 
-    /// Send any pending write-buffer data (stop-and-wait: skips if there are
-    /// unacked segments), then check for timed-out retransmissions.
+    /// Drain pending write-buffer data into outbound segments, up to the
+    /// effective send window (`min(send_window, peer_window)`), then check
+    /// for timed-out retransmissions.
     pub(crate) async fn write_buffer_flush(&mut self) -> Result<(), std::io::Error> {
         // Check retransmissions first so a timed-out connection is marked before
         // we attempt to send new data on it.
@@ -383,27 +405,36 @@ impl Adapter {
 
         let host_ports: Vec<u16> = self.states.keys().cloned().collect();
         for hp in host_ports {
-            let chunk: Vec<u8> = {
-                let Some(state) = self.states.get(&hp) else {
-                    continue;
+            // Inner loop: keep peeling off MSS-sized chunks until either the
+            // write buffer is empty or the window is full.
+            loop {
+                let chunk: Arc<[u8]> = {
+                    let Some(state) = self.states.get(&hp) else {
+                        break;
+                    };
+                    if state.write_buffer.is_empty() {
+                        break;
+                    }
+                    let cap = self.send_window.min(state.peer_window as usize);
+                    if state.bytes_in_flight >= cap {
+                        break;
+                    }
+                    let remaining = cap - state.bytes_in_flight;
+                    let n = state.write_buffer.len().min(self.mss).min(remaining);
+                    if n == 0 {
+                        break;
+                    }
+                    let v: Vec<u8> = state.write_buffer.iter().take(n).copied().collect();
+                    Arc::from(v)
                 };
-                if state.write_buffer.is_empty() {
-                    continue;
-                }
-                // Stop-and-wait: don't send new data while we have outstanding unacked segments.
-                if !state.unacked.is_empty() {
-                    continue;
-                }
-                let n = state.write_buffer.len().min(self.mss);
-                state.write_buffer.iter().take(n).copied().collect()
-            };
 
-            let chunk_len = chunk.len();
-            if self.psh(chunk, hp).await.is_err() {
-                continue;
-            }
-            if let Some(state) = self.states.get_mut(&hp) {
-                state.write_buffer.drain(..chunk_len);
+                let chunk_len = chunk.len();
+                if self.psh(chunk, hp).await.is_err() {
+                    break;
+                }
+                if let Some(state) = self.states.get_mut(&hp) {
+                    state.write_buffer.drain(..chunk_len);
+                }
             }
         }
 
@@ -418,8 +449,11 @@ impl Adapter {
         Ok(())
     }
 
-    /// Check every connection for timed-out unacked segments. Retransmit with
-    /// exponential back-off; kill the connection after MAX_RETRIES.
+    /// Check every connection for timed-out unacked segments. Retransmit the
+    /// oldest in-flight segment with exponential back-off; kill the connection
+    /// after MAX_RETRIES. Head-only retransmit suffices because TCP's
+    /// cumulative ACK semantics cause the peer to ACK everything they have
+    /// once the missing piece arrives.
     async fn check_retransmissions(&mut self) -> Result<(), std::io::Error> {
         let host_ports: Vec<u16> = self.states.keys().cloned().collect();
 
@@ -427,7 +461,7 @@ impl Adapter {
             // Decide what to do before borrowing mutably.
             enum Action {
                 Kill,
-                Retransmit { seq: u32, data: Vec<u8> },
+                Retransmit { seq: u32, data: Arc<[u8]> },
                 None,
             }
 
@@ -483,6 +517,7 @@ impl Adapter {
                                 ..Default::default()
                             },
                             u16::MAX - 1,
+                            &[],
                             &data,
                         );
                         self.ip_wrap(&tcp)
@@ -534,11 +569,19 @@ impl Adapter {
                 while let Some(seg) = state.unacked.front() {
                     let seg_end = seg.seq.wrapping_add(seg.data.len() as u32);
                     if seq_lte(seg_end, ack_num) {
-                        state.unacked.pop_front();
+                        let popped = state.unacked.pop_front().unwrap();
+                        state.bytes_in_flight =
+                            state.bytes_in_flight.saturating_sub(popped.data.len());
                     } else {
                         break;
                     }
                 }
+            }
+
+            // Update peer's advertised receive window
+            if !(res.flags.syn) {
+                let shift = state.peer_wscale.unwrap_or(0);
+                state.peer_window = (res.window_size as u32) << shift;
             }
 
             // ------------------------------------------------------------------
@@ -559,6 +602,9 @@ impl Adapter {
                         // Our SYN consumed one sequence number on our side.
                         state.seq = state.seq.wrapping_add(1);
                         state.status = ConnectionStatus::Connected;
+                        state.peer_wscale = crate::packets::parse_window_scale(&res.options);
+                        let shift = state.peer_wscale.unwrap_or(0);
+                        state.peer_window = (res.window_size as u32) << shift;
                         ack_me = Some(res.destination_port);
                     }
                     // Anything else while waiting for SYN-ACK is ignored.
@@ -636,6 +682,8 @@ impl Adapter {
                 "not connected",
             ));
         };
+        // Advertise window scaling so the peer can scale its window field.
+        let wscale = crate::packets::window_scale_option(OUR_WSCALE);
         let tcp = TcpPacket::create(
             self.host_ip,
             self.peer_ip,
@@ -648,6 +696,7 @@ impl Adapter {
                 ..Default::default()
             },
             u16::MAX - 1,
+            &wscale,
             &[],
         );
         let ip = self.ip_wrap(&tcp);
@@ -675,6 +724,7 @@ impl Adapter {
             },
             u16::MAX - 1,
             &[],
+            &[],
         );
         let ip = self.ip_wrap(&tcp);
         let _ = state;
@@ -682,9 +732,8 @@ impl Adapter {
         self.log_packet(&ip)
     }
 
-    /// Send a PSH segment and record it in the unacked queue. Takes `data` by
-    /// value so the buffer can be moved into the unacked record without a copy.
-    async fn psh(&mut self, data: Vec<u8>, host_port: u16) -> Result<(), std::io::Error> {
+    /// Send a PSH segment and record it in the unacked queue.
+    async fn psh(&mut self, data: Arc<[u8]>, host_port: u16) -> Result<(), std::io::Error> {
         let Some(state) = self.states.get(&host_port) else {
             return Err(std::io::Error::new(
                 ErrorKind::NotConnected,
@@ -709,6 +758,7 @@ impl Adapter {
                 ..Default::default()
             },
             u16::MAX - 1,
+            &[],
             &data,
         );
         let ip = self.ip_wrap(&tcp);
@@ -718,14 +768,15 @@ impl Adapter {
         self.log_packet(&ip)?;
 
         if let Some(state) = self.states.get_mut(&host_port) {
-            let len = data.len() as u32;
+            let len = data.len();
+            state.bytes_in_flight += len;
             state.unacked.push_back(UnackedSegment {
                 seq,
                 data,
                 sent_at: Instant::now(),
                 retries: 0,
             });
-            state.seq = state.seq.wrapping_add(len);
+            state.seq = state.seq.wrapping_add(len as u32);
         }
 
         Ok(())
@@ -904,6 +955,17 @@ mod tests {
 
     /// Build a raw TCP segment (not IP-wrapped) from PEER→adapter.
     fn tcp_seg(dst_port: u16, seq: u32, ack_num: u32, flags: TcpFlags, payload: &[u8]) -> Vec<u8> {
+        tcp_seg_with_opts(dst_port, seq, ack_num, flags, &[], payload)
+    }
+
+    fn tcp_seg_with_opts(
+        dst_port: u16,
+        seq: u32,
+        ack_num: u32,
+        flags: TcpFlags,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
         TcpPacket::create(
             IpAddr::V6(PEER_IP),
             IpAddr::V6(HOST_IP),
@@ -913,6 +975,7 @@ mod tests {
             ack_num,
             flags,
             u16::MAX - 1,
+            options,
             payload,
         )
     }
@@ -1077,7 +1140,6 @@ mod tests {
         );
     }
 
-    /// An ACK from the peer clears the unacked queue so new data can be sent.
     #[tokio::test]
     async fn ack_clears_unacked_queue() {
         tokio::time::pause();
@@ -1089,24 +1151,24 @@ mod tests {
             IpAddr::V6(HOST_IP),
             IpAddr::V6(PEER_IP),
         );
+        adapter.set_send_window(5);
 
         let hp = handshake(&mut adapter, &mut test_rx, &mut test_tx).await;
 
-        // Send first chunk.
         adapter.queue_send(b"first", hp).unwrap();
         adapter.write_buffer_flush().await.unwrap();
         let psh1 = read_pkt(&mut test_rx).await;
         assert_eq!(psh1.payload, b"first");
 
-        // Queue second chunk; stop-and-wait must hold it back.
-        adapter.queue_send(b"second", hp).unwrap();
+        // Queue second chunk; window is full, must be held.
+        adapter.queue_send(b"secnd", hp).unwrap();
         adapter.write_buffer_flush().await.unwrap();
 
         // Nothing should appear on the wire yet.
         let nothing = tokio::time::timeout(Duration::from_millis(10), read_pkt(&mut test_rx)).await;
         assert!(
             nothing.is_err(),
-            "second chunk must not be sent while first is unacked"
+            "second chunk must not be sent while window is full"
         );
 
         // ACK the first chunk (ack = psh1.seq + len).
@@ -1125,14 +1187,173 @@ mod tests {
             .await
             .unwrap();
 
-        // Now flush, the second chunk should go out.
+        // ACK frees window; second chunk goes out on the next flush.
         adapter.write_buffer_flush().await.unwrap();
         let psh2 = read_pkt(&mut test_rx).await;
-        assert_eq!(psh2.payload, b"second");
+        assert_eq!(psh2.payload, b"secnd");
         assert_eq!(
             psh2.sequence_number, peer_ack_num,
             "second segment starts where first left off"
         );
+    }
+
+    /// With a window larger than `mss`, multiple segments go out back-to-back
+    /// before any ACK is received.
+    #[tokio::test]
+    async fn sliding_window_sends_multiple_segments() {
+        tokio::time::pause();
+
+        let (adapter_end, test_end) = tokio::io::duplex(1 << 16);
+        let (mut test_rx, mut test_tx) = tokio::io::split(test_end);
+        let mut adapter = Adapter::new(
+            Box::new(TestTransport(adapter_end)),
+            IpAddr::V6(HOST_IP),
+            IpAddr::V6(PEER_IP),
+        );
+        adapter.set_mss(10);
+        adapter.set_send_window(40); // 4 segments worth.
+
+        let hp = handshake(&mut adapter, &mut test_rx, &mut test_tx).await;
+
+        adapter.queue_send(&[b'x'; 35], hp).unwrap();
+        adapter.write_buffer_flush().await.unwrap();
+
+        let mut total = 0;
+        for _ in 0..4 {
+            let pkt = read_pkt(&mut test_rx).await;
+            total += pkt.payload.len();
+        }
+        assert_eq!(total, 35, "all 35 bytes should be on the wire pre-ACK");
+    }
+
+    /// `send_window` caps how much can be in flight; data past the cap waits.
+    #[tokio::test]
+    async fn send_window_caps_in_flight_bytes() {
+        tokio::time::pause();
+
+        let (adapter_end, test_end) = tokio::io::duplex(1 << 16);
+        let (mut test_rx, mut test_tx) = tokio::io::split(test_end);
+        let mut adapter = Adapter::new(
+            Box::new(TestTransport(adapter_end)),
+            IpAddr::V6(HOST_IP),
+            IpAddr::V6(PEER_IP),
+        );
+        adapter.set_mss(10);
+        adapter.set_send_window(20);
+
+        let hp = handshake(&mut adapter, &mut test_rx, &mut test_tx).await;
+
+        adapter.queue_send(&[b'x'; 50], hp).unwrap();
+        adapter.write_buffer_flush().await.unwrap();
+
+        // First 20 bytes go out as two 10-byte segments.
+        let p1 = read_pkt(&mut test_rx).await;
+        let p2 = read_pkt(&mut test_rx).await;
+        assert_eq!(p1.payload.len() + p2.payload.len(), 20);
+
+        // The next 30 bytes are blocked behind the window.
+        let blocked = tokio::time::timeout(Duration::from_millis(10), read_pkt(&mut test_rx)).await;
+        assert!(blocked.is_err(), "must not exceed send_window before ACK");
+    }
+
+    /// Our outbound SYN advertises the Window Scale option (RFC 7323).
+    #[tokio::test]
+    async fn syn_advertises_window_scale() {
+        tokio::time::pause();
+
+        let (adapter_end, test_end) = tokio::io::duplex(1 << 16);
+        let (mut test_rx, _test_tx) = tokio::io::split(test_end);
+        let mut adapter = Adapter::new(
+            Box::new(TestTransport(adapter_end)),
+            IpAddr::V6(HOST_IP),
+            IpAddr::V6(PEER_IP),
+        );
+
+        // Drive connect() far enough that the SYN hits the wire.
+        let connect_fut = adapter.connect(PEER_PORT);
+        let (_unused, syn) = tokio::join!(connect_fut, async { read_pkt(&mut test_rx).await });
+
+        assert!(syn.flags.syn, "first packet must be SYN");
+        let shift =
+            crate::packets::parse_window_scale(&syn.options).expect("SYN should include WSopt");
+        assert_eq!(shift, OUR_WSCALE, "advertised wscale should match constant");
+    }
+
+    /// When the peer's SYN-ACK includes a window scale, subsequent window
+    /// advertisements are interpreted as `field << peer_wscale`.
+    #[tokio::test]
+    async fn peer_window_scale_is_honored() {
+        tokio::time::pause();
+
+        let (adapter_end, test_end) = tokio::io::duplex(1 << 16);
+        let (mut test_rx, mut test_tx) = tokio::io::split(test_end);
+        let mut adapter = Adapter::new(
+            Box::new(TestTransport(adapter_end)),
+            IpAddr::V6(HOST_IP),
+            IpAddr::V6(PEER_IP),
+        );
+        adapter.set_mss(10);
+        adapter.set_send_window(1 << 20); // effectively unlimited from our side.
+
+        let peer_wscale = 4u8;
+        let peer_raw_window = 2u16; // scaled: 2 << 4 = 32 bytes.
+
+        // Drive connect() while we manually act as the peer.
+        let (hp_result, peer_hp) = tokio::join!(adapter.connect(PEER_PORT), async {
+            let syn = read_pkt(&mut test_rx).await;
+            assert!(syn.flags.syn);
+            let hp = syn.source_port;
+
+            // SYN-ACK with WSopt and a tiny scaled window.
+            let wscale_opt = crate::packets::window_scale_option(peer_wscale);
+            let tcp = TcpPacket::create(
+                IpAddr::V6(PEER_IP),
+                IpAddr::V6(HOST_IP),
+                PEER_PORT,
+                hp,
+                PEER_ISN,
+                syn.sequence_number.wrapping_add(1),
+                TcpFlags {
+                    syn: true,
+                    ack: true,
+                    ..Default::default()
+                },
+                peer_raw_window,
+                &wscale_opt,
+                &[],
+            );
+            let ip = crate::packets::Ipv6Packet::create(
+                PEER_IP,
+                HOST_IP,
+                ProtocolNumber::Tcp,
+                255,
+                &tcp,
+            );
+            test_tx.write_all(&ip).await.unwrap();
+
+            // Consume the adapter's ACK.
+            let _ack = read_pkt(&mut test_rx).await;
+            hp
+        });
+        let hp = hp_result.expect("connect failed");
+        assert_eq!(hp, peer_hp);
+
+        // Try to send 100 bytes. With peer_window=32 and mss=10, we expect
+        // 3 full segments (30 bytes) plus one short segment (2 bytes) = 32
+        // bytes on the wire; the remaining 68 bytes must be held.
+        adapter.queue_send(&[b'a'; 100], hp).unwrap();
+        adapter.write_buffer_flush().await.unwrap();
+
+        let mut sent = 0;
+        while sent < 32 {
+            let p = read_pkt(&mut test_rx).await;
+            sent += p.payload.len();
+            assert!(sent <= 32, "must never exceed peer_window={}", 32);
+        }
+        assert_eq!(sent, 32);
+
+        let blocked = tokio::time::timeout(Duration::from_millis(10), read_pkt(&mut test_rx)).await;
+        assert!(blocked.is_err(), "must not exceed peer's scaled window");
     }
 
     #[tokio::test]
