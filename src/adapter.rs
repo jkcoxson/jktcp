@@ -25,8 +25,18 @@ use crate::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
-use crate::packets::{Ipv4Packet, Ipv6Packet, ProtocolNumber, TcpFlags, TcpPacket};
+use crate::packets::{Ipv4Packet, Ipv6Packet, ProtocolNumber, TcpFlags, TcpPacket, UdpPacket};
 use crate::{PcapLog, ReadWrite, packets::IpParseError};
+
+/// A received UDP datagram, addressed from `peer_ip:source_port` to the local
+/// `destination_port`. UDP is connectionless, so there is no socket state
+/// beyond the set of bound local ports.
+#[derive(Debug, Clone)]
+pub struct UdpDatagram {
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub data: Vec<u8>,
+}
 
 /// Maximum number of retransmission attempts before a connection is killed.
 const MAX_RETRIES: u32 = 5;
@@ -162,6 +172,7 @@ pub struct Adapter {
     /// Maximum Segment Size for TCP data (payload only, no headers).
     mss: usize,
     send_window: usize,
+    udp_sockets: HashMap<u16, VecDeque<UdpDatagram>>,
 }
 
 impl Adapter {
@@ -177,6 +188,7 @@ impl Adapter {
             pcap: None,
             mss: DEFAULT_MSS,
             send_window: DEFAULT_SEND_WINDOW,
+            udp_sockets: HashMap::new(),
         }
     }
 
@@ -192,6 +204,16 @@ impl Adapter {
     pub fn set_send_window(&mut self, window: usize) -> &mut Self {
         self.send_window = window;
         self
+    }
+
+    /// The local (host) IP address of this tunnel endpoint.
+    pub fn host_ip(&self) -> IpAddr {
+        self.host_ip
+    }
+
+    /// The remote (peer/device) IP address of this tunnel endpoint.
+    pub fn peer_ip(&self) -> IpAddr {
+        self.peer_ip
     }
 
     /// Wraps this adapter in a thread-safe handle.
@@ -540,8 +562,17 @@ impl Adapter {
     pub(crate) async fn process_tcp_packet(&mut self) -> Result<(), std::io::Error> {
         tokio::select! {
             ip_packet = self.read_ip_packet() => {
-                let ip_packet = ip_packet?;
-                self.process_tcp_packet_from_payload(&ip_packet).await
+                let (protocol, payload) = ip_packet?;
+                match protocol {
+                    p if p == ProtocolNumber::Tcp as u8 => {
+                        self.process_tcp_packet_from_payload(&payload).await
+                    }
+                    p if p == ProtocolNumber::Udp as u8 => {
+                        self.process_udp_packet(&payload);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
             }
             // Short timeout so retransmissions fire in the AdapterStream case
             // (the AdapterHandle has a 1ms tick that calls write_buffer_flush directly).
@@ -549,6 +580,75 @@ impl Adapter {
                 self.check_retransmissions().await
             }
         }
+    }
+
+    /// Parse an inbound UDP datagram and queue it if its destination port is
+    /// bound
+    fn process_udp_packet(&mut self, payload: &[u8]) {
+        let udp = match UdpPacket::parse(payload) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        if let Some(queue) = self.udp_sockets.get_mut(&udp.destination_port) {
+            trace!(
+                "udp {} bytes -> local port {}",
+                udp.payload.len(),
+                udp.destination_port
+            );
+            queue.push_back(UdpDatagram {
+                source_port: udp.source_port,
+                destination_port: udp.destination_port,
+                data: udp.payload,
+            });
+        }
+    }
+
+    /// Bind a local UDP port so inbound datagrams to it are queued
+    pub(crate) fn bind_udp(&mut self, port: u16) -> u16 {
+        let port = if port == 0 {
+            loop {
+                let p: u16 = rand::random();
+                if p >= 1024 && !self.udp_sockets.contains_key(&p) {
+                    break p;
+                }
+            }
+        } else {
+            port
+        };
+        self.udp_sockets.entry(port).or_default();
+        port
+    }
+
+    pub(crate) fn unbind_udp(&mut self, port: u16) {
+        self.udp_sockets.remove(&port);
+    }
+
+    /// Send a UDP datagram from `source_port` to the peer's `destination_port`.
+    pub(crate) async fn send_udp(
+        &mut self,
+        source_port: u16,
+        destination_port: u16,
+        data: &[u8],
+    ) -> Result<(), std::io::Error> {
+        let udp = UdpPacket::create(
+            self.host_ip,
+            self.peer_ip,
+            source_port,
+            destination_port,
+            data,
+        );
+        let ip = self.ip_wrap_proto(&udp, ProtocolNumber::Udp);
+        self.peer.write_all(&ip).await?;
+        self.log_packet(&ip)
+    }
+
+    /// Drain all queued inbound UDP datagrams across every bound port.
+    pub(crate) fn udp_drain(&mut self) -> Vec<UdpDatagram> {
+        let mut out = Vec::new();
+        for queue in self.udp_sockets.values_mut() {
+            out.extend(queue.drain(..));
+        }
+        out
     }
 
     pub(crate) async fn process_tcp_packet_from_payload(
@@ -782,7 +882,7 @@ impl Adapter {
         Ok(())
     }
 
-    async fn read_ip_packet(&mut self) -> Result<Vec<u8>, std::io::Error> {
+    async fn read_ip_packet(&mut self) -> Result<(u8, Vec<u8>), std::io::Error> {
         self.write_buffer_flush().await?;
         loop {
             let parsed = match self.host_ip {
@@ -793,7 +893,7 @@ impl Adapter {
                             packet,
                             bytes_consumed,
                         } => IpParseError::Ok {
-                            packet: packet.payload,
+                            packet: (packet.next_header, packet.payload),
                             bytes_consumed,
                         },
                         IpParseError::NotEnough => IpParseError::NotEnough,
@@ -841,9 +941,9 @@ impl Adapter {
         }
     }
 
-    /// Inspect the buffer for a complete IPv4 packet. Returns the TCP/UDP
-    /// payload and the number of bytes consumed.
-    fn try_parse_v4(buf: &[u8]) -> IpParseError<Vec<u8>> {
+    /// Inspect the buffer for a complete IPv4 packet. Returns `(protocol,
+    /// payload)` and the number of bytes consumed.
+    fn try_parse_v4(buf: &[u8]) -> IpParseError<(u8, Vec<u8>)> {
         if buf.len() < 20 {
             return IpParseError::NotEnough;
         }
@@ -863,7 +963,7 @@ impl Adapter {
             None => return IpParseError::Invalid,
         };
         IpParseError::Ok {
-            packet: packet.payload,
+            packet: (packet.protocol, packet.payload),
             bytes_consumed: total_length,
         }
     }
@@ -876,12 +976,16 @@ impl Adapter {
     }
 
     fn ip_wrap(&self, packet: &[u8]) -> Vec<u8> {
+        self.ip_wrap_proto(packet, ProtocolNumber::Tcp)
+    }
+
+    fn ip_wrap_proto(&self, packet: &[u8], protocol: ProtocolNumber) -> Vec<u8> {
         match (self.host_ip, self.peer_ip) {
             (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                Ipv4Packet::create(src, dst, ProtocolNumber::Tcp, 255, packet)
+                Ipv4Packet::create(src, dst, protocol, 255, packet)
             }
             (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                Ipv6Packet::create(src, dst, ProtocolNumber::Tcp, 255, packet)
+                Ipv6Packet::create(src, dst, protocol, 255, packet)
             }
             _ => panic!("host_ip and peer_ip must be the same IP version"),
         }

@@ -11,6 +11,7 @@ use crate::PcapLog;
 #[derive(Clone, Copy, Debug)]
 pub enum ProtocolNumber {
     Tcp = 6,
+    Udp = 17,
 }
 
 #[derive(Debug)]
@@ -723,6 +724,108 @@ impl std::fmt::Debug for TcpPacket {
             .field("checksum", &self.checksum)
             .field("urgent_pointer", &self.urgent_pointer)
             .field("options", &self.options)
+            .field("payload len", &self.payload.len())
+            .finish()
+    }
+}
+
+pub struct UdpPacket {
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub length: u16,
+    pub checksum: u16,
+    pub payload: Vec<u8>,
+}
+
+impl UdpPacket {
+    pub fn parse(packet: &[u8]) -> Result<Self, std::io::Error> {
+        if packet.len() < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not enough bytes for UDP header",
+            ));
+        }
+        let source_port = u16::from_be_bytes([packet[0], packet[1]]);
+        let destination_port = u16::from_be_bytes([packet[2], packet[3]]);
+        let length = u16::from_be_bytes([packet[4], packet[5]]);
+        let checksum = u16::from_be_bytes([packet[6], packet[7]]);
+        let payload = packet[8..].to_vec();
+        Ok(Self {
+            source_port,
+            destination_port,
+            length,
+            checksum,
+            payload,
+        })
+    }
+
+    /// Build a UDP datagram with the checksum filled in.
+    pub fn create(
+        source_ip: IpAddr,
+        destination_ip: IpAddr,
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let length = (8 + payload.len()) as u16;
+        let mut packet = Vec::with_capacity(length as usize);
+        packet.extend_from_slice(&source_port.to_be_bytes());
+        packet.extend_from_slice(&destination_port.to_be_bytes());
+        packet.extend_from_slice(&length.to_be_bytes());
+        packet.extend_from_slice(&[0, 0]); // checksum placeholder
+        packet.extend_from_slice(payload);
+
+        let checksum = match (source_ip, destination_ip) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                Self::checksum(&packet, &src.octets(), &dst.octets(), false)
+            }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                Self::checksum(&packet, &src.octets(), &dst.octets(), true)
+            }
+            _ => panic!("source and destination IP versions must match"),
+        };
+        // For IPv4 a zero checksum means "not computed"; for IPv6 a computed
+        // checksum of 0 is transmitted as 0xFFFF.
+        let checksum = if checksum == 0 { 0xFFFF } else { checksum };
+        packet[6..8].copy_from_slice(&checksum.to_be_bytes());
+        packet
+    }
+
+    fn checksum(packet: &[u8], source_ip: &[u8], destination_ip: &[u8], _is_ipv6: bool) -> u16 {
+        let mut sum = 0u32;
+        for chunk in source_ip.chunks(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        for chunk in destination_ip.chunks(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        let udp_len = packet.len() as u32;
+        sum += (udp_len >> 16) & 0xFFFF;
+        sum += udp_len & 0xFFFF;
+        sum += 17u32;
+
+        for chunk in packet.chunks(2) {
+            let word = if chunk.len() == 2 {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], 0])
+            };
+            sum += word as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+}
+
+impl std::fmt::Debug for UdpPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UdpPacket")
+            .field("source_port", &self.source_port)
+            .field("destination_port", &self.destination_port)
+            .field("length", &self.length)
+            .field("checksum", &self.checksum)
             .field("payload len", &self.payload.len())
             .finish()
     }

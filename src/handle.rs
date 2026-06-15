@@ -29,7 +29,7 @@
 //! The task exits when the last [`AdapterHandle`] is dropped or when
 //! [`AdapterHandle::close`] is called.
 
-use std::{collections::HashMap, sync::Mutex, task::Poll};
+use std::{collections::HashMap, net::IpAddr, sync::Mutex, task::Poll};
 
 #[cfg(feature = "pcap")]
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ use tokio::{
 };
 use tracing::trace;
 
-use crate::adapter::ConnectionStatus;
+use crate::adapter::{ConnectionStatus, UdpDatagram};
 use crate::time::timeout;
 
 enum HandleMessage {
@@ -49,7 +49,13 @@ enum HandleMessage {
     ConnectToPort {
         target: u16,
         res: oneshot::Sender<
-            Result<(u16, mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>), std::io::Error>,
+            Result<
+                (
+                    u16,
+                    mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>,
+                ),
+                std::io::Error,
+            >,
         >,
     },
     Close {
@@ -57,6 +63,19 @@ enum HandleMessage {
     },
     Send {
         host_port: u16,
+        data: Vec<u8>,
+        res: oneshot::Sender<Result<(), std::io::Error>>,
+    },
+    BindUdp {
+        port: u16,
+        res: oneshot::Sender<(u16, mpsc::UnboundedReceiver<UdpDatagram>)>,
+    },
+    UnbindUdp {
+        port: u16,
+    },
+    SendUdp {
+        source_port: u16,
+        destination_port: u16,
         data: Vec<u8>,
         res: oneshot::Sender<Result<(), std::io::Error>>,
     },
@@ -77,14 +96,19 @@ enum HandleMessage {
 #[derive(Debug, Clone)]
 pub struct AdapterHandle {
     sender: mpsc::UnboundedSender<HandleMessage>,
+    host_ip: IpAddr,
+    peer_ip: IpAddr,
 }
 
 impl AdapterHandle {
     pub fn new(mut adapter: crate::adapter::Adapter) -> Self {
+        let host_ip = adapter.host_ip();
+        let peer_ip = adapter.peer_ip();
         let (tx, mut rx) = mpsc::unbounded_channel::<HandleMessage>();
         crate::spawn(async move {
             let mut handles: HashMap<u16, mpsc::UnboundedSender<Result<Vec<u8>, std::io::Error>>> =
                 HashMap::new();
+            let mut udp_handles: HashMap<u16, mpsc::UnboundedSender<UdpDatagram>> = HashMap::new();
             let mut tick = crate::time::interval(std::time::Duration::from_millis(1));
 
             loop {
@@ -119,6 +143,27 @@ impl AdapterHandle {
                                         let response = adapter.write_buffer_flush().await;
                                         res.send(response).ok();
                                     }
+                                }
+                                HandleMessage::BindUdp { port, res } => {
+                                    let bound = adapter.bind_udp(port);
+                                    let (utx, urx) = mpsc::unbounded_channel();
+                                    udp_handles.insert(bound, utx);
+                                    res.send((bound, urx)).ok();
+                                }
+                                HandleMessage::UnbindUdp { port } => {
+                                    udp_handles.remove(&port);
+                                    adapter.unbind_udp(port);
+                                }
+                                HandleMessage::SendUdp {
+                                    source_port,
+                                    destination_port,
+                                    data,
+                                    res,
+                                } => {
+                                    let r = adapter
+                                        .send_udp(source_port, destination_port, &data)
+                                        .await;
+                                    res.send(r).ok();
                                 }
                                 #[cfg(feature = "pcap")]
                                 HandleMessage::Pcap {
@@ -185,6 +230,15 @@ impl AdapterHandle {
                             let _ = adapter.close(hp).await;
                         }
 
+                        // Forward any inbound UDP datagrams to their bound port's channel.
+                        if !udp_handles.is_empty() {
+                            for dg in adapter.udp_drain() {
+                                if let Some(tx) = udp_handles.get(&dg.destination_port) {
+                                    let _ = tx.send(dg);
+                                }
+                            }
+                        }
+
                         // An ACK in that packet may have cleared `unacked` for some
                         // connection; flush now instead of waiting up to 1ms for the tick.
                         let _ = adapter.write_buffer_flush().await;
@@ -197,7 +251,48 @@ impl AdapterHandle {
             }
         });
 
-        Self { sender: tx }
+        Self {
+            sender: tx,
+            host_ip,
+            peer_ip,
+        }
+    }
+
+    /// The local (host) IP of the tunnel — use this as the RTP `receiverIP`.
+    pub fn host_ip(&self) -> IpAddr {
+        self.host_ip
+    }
+
+    /// The remote (device) IP of the tunnel.
+    pub fn peer_ip(&self) -> IpAddr {
+        self.peer_ip
+    }
+
+    /// Bind a local UDP port for connectionless send/receive. Pass 0 to let
+    /// the stack choose a free port (returned in [`UdpSocketHandle::local_port`]).
+    pub async fn bind_udp(&self, port: u16) -> Result<UdpSocketHandle, std::io::Error> {
+        let (res_tx, res_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(HandleMessage::BindUdp { port, res: res_tx })
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NetworkUnreachable,
+                "adapter closed",
+            ));
+        }
+        match res_rx.await {
+            Ok((local_port, recv_channel)) => Ok(UdpSocketHandle {
+                local_port,
+                recv_channel: tokio::sync::Mutex::new(recv_channel),
+                send_channel: self.sender.clone(),
+            }),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "adapter closed",
+            )),
+        }
     }
 
     pub async fn connect(&mut self, port: u16) -> Result<StreamHandle, std::io::Error> {
@@ -407,6 +502,68 @@ impl Drop for StreamHandle {
     fn drop(&mut self) {
         let _ = self.send_channel.send(HandleMessage::Close {
             host_port: self.host_port,
+        });
+    }
+}
+
+/// A bound UDP port on the userspace stack. Connectionless: [`recv`] yields
+/// whole datagrams and [`send_to`] sends to a peer port. Dropping it unbinds
+/// the port.
+#[derive(Debug)]
+pub struct UdpSocketHandle {
+    local_port: u16,
+    // Mutex only to satisfy `Sync`; this is the sole owner of the receiver.
+    recv_channel: tokio::sync::Mutex<mpsc::UnboundedReceiver<UdpDatagram>>,
+    send_channel: mpsc::UnboundedSender<HandleMessage>,
+}
+
+impl UdpSocketHandle {
+    /// The local port datagrams are received on (and the source port of sends).
+    pub fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    /// Await the next inbound datagram. Returns `BrokenPipe` if the stack closed.
+    pub async fn recv(&self) -> Result<UdpDatagram, std::io::Error> {
+        let mut lock = self.recv_channel.lock().await;
+        match lock.recv().await {
+            Some(dg) => Ok(dg),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "adapter closed",
+            )),
+        }
+    }
+
+    /// Send a datagram from `local_port` to the peer's `destination_port`.
+    pub async fn send_to(
+        &self,
+        destination_port: u16,
+        data: Vec<u8>,
+    ) -> Result<(), std::io::Error> {
+        let (res_tx, res_rx) = oneshot::channel();
+        self.send_channel
+            .send(HandleMessage::SendUdp {
+                source_port: self.local_port,
+                destination_port,
+                data,
+                res: res_tx,
+            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "adapter closed"))?;
+        match res_rx.await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "adapter closed",
+            )),
+        }
+    }
+}
+
+impl Drop for UdpSocketHandle {
+    fn drop(&mut self) {
+        let _ = self.send_channel.send(HandleMessage::UnbindUdp {
+            port: self.local_port,
         });
     }
 }
