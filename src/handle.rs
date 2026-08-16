@@ -109,9 +109,10 @@ impl AdapterHandle {
             let mut handles: HashMap<u16, mpsc::UnboundedSender<Result<Vec<u8>, std::io::Error>>> =
                 HashMap::new();
             let mut udp_handles: HashMap<u16, mpsc::UnboundedSender<UdpDatagram>> = HashMap::new();
-            let mut tick = crate::time::interval(std::time::Duration::from_millis(1));
 
             loop {
+                let has_pending_work = adapter.has_pending_work();
+
                 tokio::select! {
                     // check for messages for us
                     msg = rx.recv() => {
@@ -244,7 +245,7 @@ impl AdapterHandle {
                         let _ = adapter.write_buffer_flush().await;
                     }
 
-                    _ = tick.tick() => {
+                    _ = crate::time::sleep(std::time::Duration::from_millis(250)), if has_pending_work => {
                         let _ = adapter.write_buffer_flush().await;
                     }
                 }
