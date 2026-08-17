@@ -417,6 +417,18 @@ impl Adapter {
     // Flush / retransmit
     // -----------------------------------------------------------------------
 
+    /// Returns true if any connection has unacked segments in flight, pending write-buffer bytes,
+    /// or connections waiting for SYN-ACK.
+    #[inline]
+    pub(crate) fn has_pending_work(&self) -> bool {
+        !self.dropped.is_empty()
+            || self.states.values().any(|s| {
+                !s.unacked.is_empty()
+                    || !s.write_buffer.is_empty()
+                    || matches!(s.status, ConnectionStatus::WaitingForSyn)
+            })
+    }
+
     /// Drain pending write-buffer data into outbound segments, up to the
     /// effective send window (`min(send_window, peer_window)`), then check
     /// for timed-out retransmissions.
