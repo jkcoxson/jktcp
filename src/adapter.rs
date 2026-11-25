@@ -44,7 +44,19 @@ const MAX_RETRIES: u32 = 5;
 /// Initial retransmission timeout in milliseconds. Doubles on each retry.
 const INITIAL_RTO_MS: u64 = 200;
 
-const OUR_WSCALE: u8 = 8;
+/// Window scale we advertise. Every segment advertises a raw window of
+/// `u16::MAX - 1`, so the effective receive window is `65534 << OUR_WSCALE`.
+///
+/// Out-of-order segments are dropped rather than buffered, so the window must
+/// stay small enough that the peer cannot put more in flight than the
+/// transport delivers in order. At 8 (a 16 MiB window) an iPhone sending a
+/// multi-megabyte DTX reply over a CoreDeviceProxy tunnel bursts past what the
+/// tunnel holds, segments go missing, everything after the gap is discarded,
+/// and the connection crawls on retransmission timeouts (stalls of 80 to 120 s
+/// per screenshot). At 4 (1 MiB, the same as `DEFAULT_SEND_WINDOW`) the same
+/// transfers had no out-of-order segments, and 2 and 4 MiB windows were no
+/// faster.
+const OUR_WSCALE: u8 = 4;
 
 /// Default cap on bytes in flight per connection, in bytes. Overridden via
 /// [`Adapter::set_send_window`].
